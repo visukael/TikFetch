@@ -1,8 +1,10 @@
+import os
 import uuid
 import asyncio
 from typing import Dict, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
@@ -23,9 +25,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"]
 )
 
-# Ensure downloads directory exists and mount for static access if needed
+# Ensure downloads directory exists and mount for static access
 ensure_download_dir()
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
@@ -35,19 +38,6 @@ tasks_progress: Dict[str, Dict[str, Any]] = {}
 
 class DownloadRequest(BaseModel):
     url: str
-
-
-class TaskStatusResponse(BaseModel):
-    task_id: str
-    status: str
-    downloaded_bytes: int = 0
-    total_bytes: int = 0
-    percentage: float = 0.0
-    speed_mbps: float = 0.0
-    filename: str = ""
-    file_path: str = ""
-    file_size: int = 0
-    error: str = ""
 
 
 @app.get("/api/health")
@@ -62,6 +52,24 @@ async def get_progress(task_id: str):
     return tasks_progress[task_id]
 
 
+@app.get("/api/download-file/{filename}")
+async def get_download_file(filename: str):
+    """
+    Serves the file with Content-Disposition: attachment header
+    to trigger native browser file download directly.
+    """
+    file_path = os.path.join(DOWNLOAD_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
 async def run_download_task(task_id: str, tiktok_url: str):
     tasks_progress[task_id] = {
         "task_id": task_id,
@@ -73,6 +81,7 @@ async def run_download_task(task_id: str, tiktok_url: str):
         "filename": "",
         "file_path": "",
         "file_size": 0,
+        "download_url": "",
         "error": ""
     }
 
@@ -89,18 +98,22 @@ async def run_download_task(task_id: str, tiktok_url: str):
         # Step 1: Extract MP4 HD URL from TikDownloader
         hd_url = await extract_hd_download_url(tiktok_url)
         
-        # Step 2: Download file directly
+        # Step 2: Download file to server cache
         result = await download_file(
             file_url=hd_url,
             progress_callback=progress_cb
         )
 
+        filename = result["filename"]
+        download_url = f"/api/download-file/{filename}"
+
         tasks_progress[task_id].update({
             "status": "completed",
             "percentage": 100.0,
-            "filename": result["filename"],
+            "filename": filename,
             "file_path": result["file_path"],
-            "file_size": result["file_size"]
+            "file_size": result["file_size"],
+            "download_url": download_url
         })
 
     except HDNotAvailableError as exc:

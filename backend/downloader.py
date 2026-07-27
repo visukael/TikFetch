@@ -2,6 +2,7 @@ import os
 import re
 import time
 from typing import Callable, Optional
+import httpx
 from curl_cffi.requests import AsyncSession
 
 
@@ -27,7 +28,7 @@ async def download_file(
 ) -> dict:
     """
     Downloads the original HD file directly without modification or transcoding.
-    Uses browser impersonation and async chunk streaming for optimal performance.
+    Uses httpx with curl_cffi fallback to ensure resilient CDN access.
     Saves directly to backend/downloads/.
     """
     downloads_path = ensure_download_dir()
@@ -45,45 +46,93 @@ async def download_file(
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "*/*",
+        "Accept-Encoding": "identity",
         "Referer": "https://tikdownloader.io/"
     }
 
-    async with AsyncSession(impersonate="chrome", timeout=120.0) as session:
+    download_success = False
+    last_error = ""
+
+    # Strategy 1: Fast HTTPX async download
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, verify=False) as client:
+            async with client.stream("GET", file_url, headers=headers) as response:
+                if response.status_code == 200:
+                    total_bytes = int(response.headers.get("Content-Length", 0))
+                    downloaded_bytes = 0
+                    start_time = time.time()
+
+                    with open(file_path, "wb") as f:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 64):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                
+                                elapsed = time.time() - start_time
+                                speed_bps = downloaded_bytes / elapsed if elapsed > 0 else 0
+                                percentage = round((downloaded_bytes / total_bytes * 100), 2) if total_bytes > 0 else 0.0
+
+                                if progress_callback:
+                                    progress_callback({
+                                        "status": "downloading",
+                                        "downloaded_bytes": downloaded_bytes,
+                                        "total_bytes": total_bytes,
+                                        "percentage": percentage,
+                                        "speed_mbps": round(speed_bps / (1024 * 1024), 2)
+                                    })
+                    download_success = True
+                else:
+                    last_error = f"HTTP status {response.status_code}"
+    except Exception as exc:
+        last_error = str(exc)
+
+    # Strategy 2: curl_cffi AsyncSession fallback
+    if not download_success:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
         try:
-            response = await session.get(file_url, headers=headers, stream=True)
-            if response.status_code != 200:
-                raise Exception(f"Failed to fetch video file. Remote server returned HTTP {response.status_code}.")
+            async with AsyncSession(impersonate="chrome", timeout=60.0, verify=False) as session:
+                response = await session.get(file_url, headers=headers, stream=True)
+                if response.status_code == 200:
+                    total_bytes = int(response.headers.get("Content-Length", 0))
+                    downloaded_bytes = 0
+                    start_time = time.time()
 
-            total_bytes = int(response.headers.get("Content-Length", 0))
-            downloaded_bytes = 0
-            start_time = time.time()
+                    with open(file_path, "wb") as f:
+                        async for chunk in response.aiter_content(1024 * 64):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                
+                                elapsed = time.time() - start_time
+                                speed_bps = downloaded_bytes / elapsed if elapsed > 0 else 0
+                                percentage = round((downloaded_bytes / total_bytes * 100), 2) if total_bytes > 0 else 0.0
 
-            with open(file_path, "wb") as f:
-                async for chunk in response.aiter_content(1024 * 64):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded_bytes += len(chunk)
-                        
-                        elapsed = time.time() - start_time
-                        speed_bps = downloaded_bytes / elapsed if elapsed > 0 else 0
-                        percentage = round((downloaded_bytes / total_bytes * 100), 2) if total_bytes > 0 else 0.0
-
-                        if progress_callback:
-                            progress_callback({
-                                "status": "downloading",
-                                "downloaded_bytes": downloaded_bytes,
-                                "total_bytes": total_bytes,
-                                "percentage": percentage,
-                                "speed_mbps": round(speed_bps / (1024 * 1024), 2)
-                            })
-
+                                if progress_callback:
+                                    progress_callback({
+                                        "status": "downloading",
+                                        "downloaded_bytes": downloaded_bytes,
+                                        "total_bytes": total_bytes,
+                                        "percentage": percentage,
+                                        "speed_mbps": round(speed_bps / (1024 * 1024), 2)
+                                    })
+                    download_success = True
+                else:
+                    last_error = f"Fallback HTTP status {response.status_code}"
         except Exception as exc:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
-            raise Exception(f"Download stream error: {str(exc)}")
+            last_error = str(exc)
+
+    if not download_success:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        raise Exception(f"Could not connect to video CDN server: {last_error}")
 
     file_size = os.path.getsize(file_path)
     return {
