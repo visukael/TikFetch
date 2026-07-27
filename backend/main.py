@@ -1,12 +1,12 @@
-import os
+import io
 import uuid
 import asyncio
 import zipfile
+import urllib.parse
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from extractor import (
@@ -17,7 +17,7 @@ from extractor import (
     InvalidURLError,
     TikDownloaderError
 )
-from downloader import download_file, ensure_download_dir, DOWNLOAD_DIR
+from downloader import stream_video_bytes, fetch_video_bytes, sanitize_filename
 
 app = FastAPI(title="TikTok HD Downloader API", version="1.0.0")
 
@@ -31,10 +31,6 @@ app.add_middleware(
     expose_headers=["Content-Disposition"]
 )
 
-# Ensure downloads directory exists and mount for static access
-ensure_download_dir()
-app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
-
 # In-memory download task stores
 tasks_progress: Dict[str, Dict[str, Any]] = {}
 batch_progress: Dict[str, Dict[str, Any]] = {}
@@ -46,6 +42,20 @@ class DownloadRequest(BaseModel):
 
 class BatchDownloadRequest(BaseModel):
     urls: List[str]
+
+
+class BatchRetryRequest(BaseModel):
+    batch_id: str
+    item_indices: Optional[List[int]] = None
+
+
+class BatchControlRequest(BaseModel):
+    batch_id: str
+    action: str  # "pause" | "resume" | "cancel"
+
+
+class CancelTaskRequest(BaseModel):
+    task_id: str
 
 
 class ProfileRequest(BaseModel):
@@ -76,22 +86,79 @@ async def get_batch_progress(batch_id: str):
     return batch_progress[batch_id]
 
 
-@app.get("/api/download-file/{filename}")
-async def get_download_file(filename: str):
+@app.get("/api/stream-video")
+async def stream_video(
+    url: Optional[str] = Query(None),
+    cdn_url: Optional[str] = Query(None),
+    filename: Optional[str] = Query(None)
+):
     """
-    Serves the file with Content-Disposition: attachment header
-    to trigger native browser file download directly.
+    Streams HD TikTok video directly to the browser without saving to disk.
+    Triggers native browser download via Content-Disposition attachment header.
     """
-    file_path = os.path.join(DOWNLOAD_DIR, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
+    if not cdn_url or not filename:
+        if not url:
+            raise HTTPException(status_code=400, detail="TikTok video URL or cdn_url parameter is required.")
+        try:
+            meta = await extract_hd_download_url(url.strip())
+            cdn_url = meta["download_url"]
+            filename = meta["filename"]
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to extract video: {str(exc)}")
 
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    clean_filename = sanitize_filename(filename)
+    encoded_filename = urllib.parse.quote(clean_filename)
+
+    return StreamingResponse(
+        stream_video_bytes(cdn_url),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{clean_filename}"; filename*=UTF-8\'\'{encoded_filename}'
+        }
     )
+
+
+@app.get("/api/batch-zip/{batch_id}")
+async def get_batch_zip(batch_id: str):
+    """
+    Generates an in-memory ZIP archive of all completed videos in the batch on-demand.
+    Bypasses saving files to server disk.
+    """
+    if batch_id not in batch_progress:
+        raise HTTPException(status_code=404, detail="Batch task not found")
+
+    b_data = batch_progress[batch_id]
+    completed_items = [item for item in b_data.get("items", []) if item.get("status") == "completed" and item.get("cdn_url")]
+
+    if not completed_items:
+        raise HTTPException(status_code=400, detail="No completed video downloads found in this batch.")
+
+    zip_buffer = io.BytesIO()
+
+    try:
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for item in completed_items:
+                cdn_url = item["cdn_url"]
+                fname = item.get("filename") or f"video_{item['id']}.mp4"
+                try:
+                    video_bytes = await fetch_video_bytes(cdn_url)
+                    zipf.writestr(fname, video_bytes)
+                except Exception as e:
+                    print(f"Failed to fetch bytes for {fname}: {e}")
+
+        zip_buffer.seek(0)
+        zip_filename = f"Tikfetch_batch_{batch_id[:8]}.zip"
+        encoded_zip_name = urllib.parse.quote(zip_filename)
+
+        return StreamingResponse(
+            iter([zip_buffer.getvalue()]),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{zip_filename}"; filename*=UTF-8\'\'{encoded_zip_name}'
+            }
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate batch ZIP: {str(exc)}")
 
 
 @app.post("/api/profile")
@@ -111,9 +178,6 @@ async def get_user_profile(req: ProfileRequest):
 
 @app.post("/api/preview-url")
 async def get_preview_url(req: PreviewRequest):
-    """
-    Extracts the direct HD MP4 CDN stream URL for direct HTML5 video playback.
-    """
     if not req.url or not req.url.strip():
         raise HTTPException(status_code=400, detail="TikTok video URL is required.")
 
@@ -129,55 +193,87 @@ async def get_preview_url(req: PreviewRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-async def run_download_task(task_id: str, tiktok_url: str):
+async def run_single_extraction_task(task_id: str, tiktok_url: str):
     tasks_progress[task_id] = {
         "task_id": task_id,
         "status": "extracting",
-        "downloaded_bytes": 0,
-        "total_bytes": 0,
-        "percentage": 0.0,
-        "speed_mbps": 0.0,
         "filename": "",
-        "file_path": "",
-        "file_size": 0,
-        "download_url": "",
+        "cdn_url": "",
+        "download_stream_url": "",
         "error": ""
     }
 
-    def progress_cb(data: dict):
-        tasks_progress[task_id].update({
-            "status": "downloading",
-            "downloaded_bytes": data.get("downloaded_bytes", 0),
-            "total_bytes": data.get("total_bytes", 0),
-            "percentage": data.get("percentage", 0.0),
-            "speed_mbps": data.get("speed_mbps", 0.0)
-        })
-
     try:
         meta = await extract_hd_download_url(tiktok_url)
-        result = await download_file(
-            file_url=meta["download_url"],
-            output_filename=meta["filename"],
-            progress_callback=progress_cb
-        )
+        if tasks_progress[task_id].get("status") == "cancelled":
+            return
 
-        filename = result["filename"]
-        download_url = f"/api/download-file/{filename}"
+        cdn_url = meta["download_url"]
+        filename = meta["filename"]
+        stream_endpoint = f"/api/stream-video?cdn_url={urllib.parse.quote(cdn_url)}&filename={urllib.parse.quote(filename)}"
 
         tasks_progress[task_id].update({
             "status": "completed",
-            "percentage": 100.0,
             "filename": filename,
-            "file_path": result["file_path"],
-            "file_size": result["file_size"],
-            "download_url": download_url
+            "cdn_url": cdn_url,
+            "download_stream_url": stream_endpoint
         })
 
     except Exception as exc:
-        tasks_progress[task_id].update({
-            "status": "error",
-            "error": str(exc)
-        })
+        if tasks_progress[task_id].get("status") != "cancelled":
+            tasks_progress[task_id].update({
+                "status": "error",
+                "error": str(exc)
+            })
+
+
+async def process_single_batch_item(batch_id: str, item_info, semaphore: asyncio.Semaphore):
+    async with semaphore:
+        b_data = batch_progress.get(batch_id)
+        if not b_data:
+            return
+
+        # Check pause or cancel before starting
+        while b_data.get("status") == "paused":
+            await asyncio.sleep(0.5)
+
+        if b_data.get("status") == "cancelled":
+            b_data["items"][item_info["index"]]["status"] = "cancelled"
+            return
+
+        item_idx = item_info["index"]
+        item_url = item_info["url"]
+
+        b_data["items"][item_idx]["status"] = "extracting"
+        b_data["items"][item_idx]["error"] = ""
+
+        try:
+            meta = await extract_hd_download_url(item_url)
+            
+            # Check pause/cancel after extraction
+            if b_data.get("status") == "cancelled":
+                b_data["items"][item_idx]["status"] = "cancelled"
+                return
+
+            cdn_url = meta["download_url"]
+            filename = meta["filename"]
+            stream_url = f"/api/stream-video?cdn_url={urllib.parse.quote(cdn_url)}&filename={urllib.parse.quote(filename)}"
+
+            b_data["items"][item_idx].update({
+                "status": "completed",
+                "filename": filename,
+                "cdn_url": cdn_url,
+                "download_url": stream_url
+            })
+            b_data["completed_count"] += 1
+
+        except Exception as exc:
+            if b_data.get("status") != "cancelled":
+                b_data["items"][item_idx].update({
+                    "status": "error",
+                    "error": str(exc)
+                })
+                b_data["failed_count"] += 1
 
 
 async def run_batch_download_task(batch_id: str, raw_urls: List[str]):
@@ -187,7 +283,7 @@ async def run_batch_download_task(batch_id: str, raw_urls: List[str]):
         if cleaned:
             valid_items.append({"index": idx, "url": cleaned})
 
-    batch_data = {
+    batch_progress[batch_id] = {
         "batch_id": batch_id,
         "status": "processing",
         "total": len(valid_items),
@@ -199,76 +295,28 @@ async def run_batch_download_task(batch_id: str, raw_urls: List[str]):
                 "url": item["url"],
                 "status": "pending",
                 "filename": "",
-                "file_size": 0,
+                "cdn_url": "",
                 "download_url": "",
                 "error": ""
             }
             for item in valid_items
-        ],
-        "zip_url": ""
+        ]
     }
-    batch_progress[batch_id] = batch_data
 
-    semaphore = asyncio.Semaphore(2)  # Limit concurrent extractions
-    successful_file_paths = []
+    semaphore = asyncio.Semaphore(3)
+    await asyncio.gather(*[process_single_batch_item(batch_id, item, semaphore) for item in valid_items])
 
-    async def process_single_item(item_info):
-        async with semaphore:
-            item_idx = item_info["index"]
-            item_url = item_info["url"]
-
-            batch_progress[batch_id]["items"][item_idx]["status"] = "extracting"
-
-            try:
-                meta = await extract_hd_download_url(item_url)
-                batch_progress[batch_id]["items"][item_idx]["status"] = "downloading"
-                
-                result = await download_file(
-                    file_url=meta["download_url"],
-                    output_filename=meta["filename"]
-                )
-
-                filename = result["filename"]
-                file_path = result["file_path"]
-                file_size = result["file_size"]
-                download_url = f"/api/download-file/{filename}"
-
-                batch_progress[batch_id]["items"][item_idx].update({
-                    "status": "completed",
-                    "filename": filename,
-                    "file_size": file_size,
-                    "download_url": download_url
-                })
-                batch_progress[batch_id]["completed_count"] += 1
-                successful_file_paths.append(file_path)
-
-            except Exception as exc:
-                batch_progress[batch_id]["items"][item_idx].update({
-                    "status": "error",
-                    "error": str(exc)
-                })
-                batch_progress[batch_id]["failed_count"] += 1
-
-    await asyncio.gather(*[process_single_item(item) for item in valid_items])
-
-    if successful_file_paths:
-        zip_filename = f"Tikfetch_batch_{batch_id[:8]}.zip"
-        zip_path = os.path.join(DOWNLOAD_DIR, zip_filename)
-        try:
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for fpath in successful_file_paths:
-                    if os.path.exists(fpath):
-                        zipf.write(fpath, arcname=os.path.basename(fpath))
-            batch_progress[batch_id]["zip_url"] = f"/api/download-file/{zip_filename}"
-        except Exception as e:
-            print("Failed to build ZIP archive:", e)
-
-    if batch_progress[batch_id]["failed_count"] == 0:
-        batch_progress[batch_id]["status"] = "completed"
-    elif batch_progress[batch_id]["completed_count"] > 0:
-        batch_progress[batch_id]["status"] = "partial_error"
+    b_data = batch_progress[batch_id]
+    if b_data["status"] == "cancelled":
+        for item in b_data["items"]:
+            if item["status"] == "pending" or item["status"] == "extracting":
+                item["status"] = "cancelled"
+    elif b_data["failed_count"] == 0:
+        b_data["status"] = "completed"
+    elif b_data["completed_count"] > 0:
+        b_data["status"] = "partial_error"
     else:
-        batch_progress[batch_id]["status"] = "error"
+        b_data["status"] = "error"
 
 
 @app.post("/api/download")
@@ -277,12 +325,20 @@ async def start_download(req: DownloadRequest, background_tasks: BackgroundTasks
         raise HTTPException(status_code=400, detail="TikTok video URL is required.")
 
     task_id = str(uuid.uuid4())
-    background_tasks.add_task(run_download_task, task_id, req.url.strip())
+    background_tasks.add_task(run_single_extraction_task, task_id, req.url.strip())
     
     return {
         "status": "started",
         "task_id": task_id
     }
+
+
+@app.post("/api/cancel-task")
+async def cancel_single_task(req: CancelTaskRequest):
+    if req.task_id in tasks_progress:
+        tasks_progress[req.task_id]["status"] = "cancelled"
+        return {"status": "cancelled", "task_id": req.task_id}
+    raise HTTPException(status_code=404, detail="Task not found.")
 
 
 @app.post("/api/batch-download")
@@ -309,6 +365,75 @@ async def start_batch_download(req: BatchDownloadRequest, background_tasks: Back
         "batch_id": batch_id,
         "total_urls": len(urls_list)
     }
+
+
+@app.post("/api/batch-control")
+async def control_batch_task(req: BatchControlRequest):
+    """
+    Pause, resume, or cancel an active batch download task.
+    """
+    if req.batch_id not in batch_progress:
+        raise HTTPException(status_code=404, detail="Batch task not found.")
+
+    b_data = batch_progress[req.batch_id]
+    action = req.action.lower().strip()
+
+    if action == "pause":
+        if b_data["status"] == "processing":
+            b_data["status"] = "paused"
+            return {"status": "paused", "batch_id": req.batch_id}
+    elif action == "resume":
+        if b_data["status"] == "paused":
+            b_data["status"] = "processing"
+            return {"status": "processing", "batch_id": req.batch_id}
+    elif action == "cancel":
+        b_data["status"] = "cancelled"
+        for item in b_data["items"]:
+            if item["status"] in ["pending", "extracting"]:
+                item["status"] = "cancelled"
+        return {"status": "cancelled", "batch_id": req.batch_id}
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action. Use 'pause', 'resume', or 'cancel'.")
+
+    return {"status": b_data["status"], "batch_id": req.batch_id}
+
+
+@app.post("/api/batch-retry")
+async def retry_batch_items(req: BatchRetryRequest, background_tasks: BackgroundTasks):
+    if req.batch_id not in batch_progress:
+        raise HTTPException(status_code=404, detail="Batch task not found.")
+
+    b_data = batch_progress[req.batch_id]
+    items_to_retry = []
+
+    for item in b_data["items"]:
+        if item["status"] in ["error", "cancelled"]:
+            if req.item_indices is None or item["id"] in req.item_indices:
+                items_to_retry.append({"index": item["id"], "url": item["url"]})
+
+    if not items_to_retry:
+        return {"status": "ignored", "message": "No failed items to retry."}
+
+    b_data["status"] = "processing"
+    for item_info in items_to_retry:
+        idx = item_info["index"]
+        b_data["items"][idx]["status"] = "pending"
+        b_data["items"][idx]["error"] = ""
+        b_data["failed_count"] = max(0, b_data["failed_count"] - 1)
+
+    async def run_retry_task():
+        semaphore = asyncio.Semaphore(3)
+        await asyncio.gather(*[process_single_batch_item(req.batch_id, item, semaphore) for item in items_to_retry])
+        
+        if b_data["failed_count"] == 0:
+            b_data["status"] = "completed"
+        elif b_data["completed_count"] > 0:
+            b_data["status"] = "partial_error"
+        else:
+            b_data["status"] = "error"
+
+    background_tasks.add_task(run_retry_task)
+    return {"status": "retrying", "retried_count": len(items_to_retry)}
 
 
 if __name__ == "__main__":
