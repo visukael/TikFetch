@@ -1,5 +1,11 @@
 import unittest
-from extractor import parse_hd_link_from_html, validate_tiktok_url, HDNotAvailableError, InvalidURLError
+from extractor import (
+    parse_hd_link_from_html,
+    validate_tiktok_url,
+    extract_tiktok_metadata,
+    HDNotAvailableError,
+    InvalidURLError
+)
 
 
 class TestTikTokExtractor(unittest.TestCase):
@@ -23,6 +29,13 @@ class TestTikTokExtractor(unittest.TestCase):
         for url in invalid_urls:
             with self.assertRaises(InvalidURLError):
                 validate_tiktok_url(url)
+
+    def test_extract_tiktok_metadata_filename(self):
+        url = "https://www.tiktok.com/@khaby.lame/video/6987114400584731909"
+        meta = extract_tiktok_metadata(url)
+        self.assertEqual(meta["username"], "khaby.lame")
+        self.assertEqual(meta["video_id"], "6987114400584731909")
+        self.assertEqual(meta["filename"], "Tikfetch_@khaby.lame_6987114400584731909.mp4")
 
     def test_parse_hd_link_success(self):
         sample_html = """

@@ -32,10 +32,61 @@ def validate_tiktok_url(url: str) -> str:
     return url
 
 
-async def extract_hd_download_url(tiktok_url: str) -> str:
+def extract_tiktok_metadata(tiktok_url: str, html_content: str = "") -> dict:
+    """
+    Extracts TikTok username and video ID from URL and HTML content.
+    Generates standardized filename: Tikfetch_@username_videoID.mp4
+    """
+    username = ""
+    video_id = ""
+
+    # 1. Extract username from TikTok URL (@username)
+    user_match = re.search(r'@([a-zA-Z0-9_\.]+)', tiktok_url)
+    if user_match:
+        username = user_match.group(1)
+
+    # Extract video_id from URL (/video/123456789)
+    id_match = re.search(r'/video/(\d+)', tiktok_url)
+    if id_match:
+        video_id = id_match.group(1)
+
+    # 2. Search username in HTML content if missing
+    if not username and html_content:
+        soup = BeautifulSoup(html_content, "html.parser")
+        text = soup.get_text()
+        found_at = re.search(r'@([a-zA-Z0-9_\.]+)', text)
+        if found_at:
+            username = found_at.group(1)
+        else:
+            for img in soup.find_all("img"):
+                alt = img.get("alt", "")
+                if "@" in alt:
+                    found_alt = re.search(r'@([a-zA-Z0-9_\.]+)', alt)
+                    if found_alt:
+                        username = found_alt.group(1)
+                        break
+
+    clean_user = username.strip().lstrip("@") if username else "video"
+    
+    if not video_id:
+        short_match = re.search(r'tiktok\.com/([a-zA-Z0-9]+)', tiktok_url)
+        if short_match:
+            video_id = short_match.group(1)
+        else:
+            video_id = "hd"
+
+    filename = f"Tikfetch_@{clean_user}_{video_id}.mp4"
+    return {
+        "username": clean_user,
+        "video_id": video_id,
+        "filename": filename
+    }
+
+
+async def extract_hd_download_url(tiktok_url: str) -> dict:
     """
     Requests tikdownloader.io/api/ajaxSearch using Chrome browser TLS impersonation
-    to bypass Cloudflare anti-bot checks, then extracts the HD download URL.
+    to bypass Cloudflare anti-bot checks, then extracts the HD download URL and video metadata.
     Only searches for 'Download MP4 HD' button.
     Raises HDNotAvailableError if HD version is not available.
     """
@@ -102,7 +153,10 @@ async def extract_hd_download_url(tiktok_url: str) -> str:
         raise TikDownloaderError("No video HTML returned in TikDownloader response.")
 
     hd_url = parse_hd_link_from_html(html_data)
-    return hd_url
+    meta = extract_tiktok_metadata(valid_url, html_data)
+    meta["download_url"] = hd_url
+    
+    return meta
 
 
 def parse_hd_link_from_html(html_content: str) -> str:

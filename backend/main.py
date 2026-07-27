@@ -1,15 +1,17 @@
 import os
 import uuid
 import asyncio
-from typing import Dict, Any
+import zipfile
+from typing import Dict, Any, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
 from extractor import (
     extract_hd_download_url,
+    validate_tiktok_url,
     HDNotAvailableError,
     InvalidURLError,
     TikDownloaderError
@@ -32,12 +34,17 @@ app.add_middleware(
 ensure_download_dir()
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
-# In-memory download task progress store
+# In-memory download task stores
 tasks_progress: Dict[str, Dict[str, Any]] = {}
+batch_progress: Dict[str, Dict[str, Any]] = {}
 
 
 class DownloadRequest(BaseModel):
     url: str
+
+
+class BatchDownloadRequest(BaseModel):
+    urls: List[str]
 
 
 @app.get("/api/health")
@@ -50,6 +57,13 @@ async def get_progress(task_id: str):
     if task_id not in tasks_progress:
         raise HTTPException(status_code=404, detail="Task not found")
     return tasks_progress[task_id]
+
+
+@app.get("/api/batch-progress/{batch_id}")
+async def get_batch_progress(batch_id: str):
+    if batch_id not in batch_progress:
+        raise HTTPException(status_code=404, detail="Batch task not found")
+    return batch_progress[batch_id]
 
 
 @app.get("/api/download-file/{filename}")
@@ -95,12 +109,10 @@ async def run_download_task(task_id: str, tiktok_url: str):
         })
 
     try:
-        # Step 1: Extract MP4 HD URL from TikDownloader
-        hd_url = await extract_hd_download_url(tiktok_url)
-        
-        # Step 2: Download file to server cache
+        meta = await extract_hd_download_url(tiktok_url)
         result = await download_file(
-            file_url=hd_url,
+            file_url=meta["download_url"],
+            output_filename=meta["filename"],
             progress_callback=progress_cb
         )
 
@@ -116,26 +128,106 @@ async def run_download_task(task_id: str, tiktok_url: str):
             "download_url": download_url
         })
 
-    except HDNotAvailableError as exc:
-        tasks_progress[task_id].update({
-            "status": "error",
-            "error": str(exc)
-        })
-    except InvalidURLError as exc:
-        tasks_progress[task_id].update({
-            "status": "error",
-            "error": str(exc)
-        })
-    except TikDownloaderError as exc:
-        tasks_progress[task_id].update({
-            "status": "error",
-            "error": str(exc)
-        })
     except Exception as exc:
         tasks_progress[task_id].update({
             "status": "error",
-            "error": f"Download failed: {str(exc)}"
+            "error": str(exc)
         })
+
+
+async def run_batch_download_task(batch_id: str, raw_urls: List[str]):
+    # Clean and validate URLs
+    valid_items = []
+    for idx, raw_u in enumerate(raw_urls):
+        cleaned = raw_u.strip()
+        if cleaned:
+            valid_items.append({"index": idx, "url": cleaned})
+
+    batch_data = {
+        "batch_id": batch_id,
+        "status": "processing",
+        "total": len(valid_items),
+        "completed_count": 0,
+        "failed_count": 0,
+        "items": [
+            {
+                "id": item["index"],
+                "url": item["url"],
+                "status": "pending",
+                "filename": "",
+                "file_size": 0,
+                "download_url": "",
+                "error": ""
+            }
+            for item in valid_items
+        ],
+        "zip_url": ""
+    }
+    batch_progress[batch_id] = batch_data
+
+    semaphore = asyncio.Semaphore(2)  # Limit concurrent extractions
+    successful_file_paths = []
+
+    async def process_single_item(item_info):
+        async with semaphore:
+            item_idx = item_info["index"]
+            item_url = item_info["url"]
+
+            batch_progress[batch_id]["items"][item_idx]["status"] = "extracting"
+
+            try:
+                meta = await extract_hd_download_url(item_url)
+                batch_progress[batch_id]["items"][item_idx]["status"] = "downloading"
+                
+                result = await download_file(
+                    file_url=meta["download_url"],
+                    output_filename=meta["filename"]
+                )
+
+                filename = result["filename"]
+                file_path = result["file_path"]
+                file_size = result["file_size"]
+                download_url = f"/api/download-file/{filename}"
+
+                batch_progress[batch_id]["items"][item_idx].update({
+                    "status": "completed",
+                    "filename": filename,
+                    "file_size": file_size,
+                    "download_url": download_url
+                })
+                batch_progress[batch_id]["completed_count"] += 1
+                successful_file_paths.append(file_path)
+
+            except Exception as exc:
+                batch_progress[batch_id]["items"][item_idx].update({
+                    "status": "error",
+                    "error": str(exc)
+                })
+                batch_progress[batch_id]["failed_count"] += 1
+
+    # Run tasks concurrently
+    await asyncio.gather(*[process_single_item(item) for item in valid_items])
+
+    # Generate ZIP package if files exist
+    if successful_file_paths:
+        zip_filename = f"Tikfetch_batch_{batch_id[:8]}.zip"
+        zip_path = os.path.join(DOWNLOAD_DIR, zip_filename)
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for fpath in successful_file_paths:
+                    if os.path.exists(fpath):
+                        zipf.write(fpath, arcname=os.path.basename(fpath))
+            batch_progress[batch_id]["zip_url"] = f"/api/download-file/{zip_filename}"
+        except Exception as e:
+            print("Failed to build ZIP archive:", e)
+
+    # Update overall batch status
+    if batch_progress[batch_id]["failed_count"] == 0:
+        batch_progress[batch_id]["status"] = "completed"
+    elif batch_progress[batch_id]["completed_count"] > 0:
+        batch_progress[batch_id]["status"] = "partial_error"
+    else:
+        batch_progress[batch_id]["status"] = "error"
 
 
 @app.post("/api/download")
@@ -149,6 +241,32 @@ async def start_download(req: DownloadRequest, background_tasks: BackgroundTasks
     return {
         "status": "started",
         "task_id": task_id
+    }
+
+
+@app.post("/api/batch-download")
+async def start_batch_download(req: BatchDownloadRequest, background_tasks: BackgroundTasks):
+    if not req.urls or len(req.urls) == 0:
+        raise HTTPException(status_code=400, detail="At least one TikTok video URL is required.")
+
+    urls_list = []
+    for u in req.urls:
+        lines = u.replace(",", "\n").replace(" ", "\n").split("\n")
+        for line in lines:
+            line_str = line.strip()
+            if line_str and "tiktok.com" in line_str.lower():
+                urls_list.append(line_str)
+
+    if not urls_list:
+        raise HTTPException(status_code=400, detail="No valid TikTok URLs found in the request.")
+
+    batch_id = str(uuid.uuid4())
+    background_tasks.add_task(run_batch_download_task, batch_id, urls_list)
+
+    return {
+        "status": "started",
+        "batch_id": batch_id,
+        "total_urls": len(urls_list)
     }
 
 
