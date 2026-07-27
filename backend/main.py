@@ -2,7 +2,7 @@ import os
 import uuid
 import asyncio
 import zipfile
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from extractor import (
     extract_hd_download_url,
     validate_tiktok_url,
+    fetch_profile_videos,
     HDNotAvailableError,
     InvalidURLError,
     TikDownloaderError
@@ -45,6 +46,15 @@ class DownloadRequest(BaseModel):
 
 class BatchDownloadRequest(BaseModel):
     urls: List[str]
+
+
+class ProfileRequest(BaseModel):
+    username_or_url: str
+    limit: Optional[int] = 0
+
+
+class PreviewRequest(BaseModel):
+    url: str
 
 
 @app.get("/api/health")
@@ -82,6 +92,41 @@ async def get_download_file(filename: str):
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+
+@app.post("/api/profile")
+async def get_user_profile(req: ProfileRequest):
+    if not req.username_or_url or not req.username_or_url.strip():
+        raise HTTPException(status_code=400, detail="TikTok username or profile URL is required.")
+
+    try:
+        limit = req.limit if req.limit is not None and req.limit >= 0 else 0
+        data = await asyncio.to_thread(fetch_profile_videos, req.username_or_url.strip(), limit)
+        return data
+    except TikDownloaderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch profile videos: {str(exc)}")
+
+
+@app.post("/api/preview-url")
+async def get_preview_url(req: PreviewRequest):
+    """
+    Extracts the direct HD MP4 CDN stream URL for direct HTML5 video playback.
+    """
+    if not req.url or not req.url.strip():
+        raise HTTPException(status_code=400, detail="TikTok video URL is required.")
+
+    try:
+        meta = await extract_hd_download_url(req.url.strip())
+        return {
+            "status": "ok",
+            "download_url": meta["download_url"],
+            "filename": meta["filename"],
+            "username": meta["username"]
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 async def run_download_task(task_id: str, tiktok_url: str):
@@ -136,7 +181,6 @@ async def run_download_task(task_id: str, tiktok_url: str):
 
 
 async def run_batch_download_task(batch_id: str, raw_urls: List[str]):
-    # Clean and validate URLs
     valid_items = []
     for idx, raw_u in enumerate(raw_urls):
         cleaned = raw_u.strip()
@@ -205,10 +249,8 @@ async def run_batch_download_task(batch_id: str, raw_urls: List[str]):
                 })
                 batch_progress[batch_id]["failed_count"] += 1
 
-    # Run tasks concurrently
     await asyncio.gather(*[process_single_item(item) for item in valid_items])
 
-    # Generate ZIP package if files exist
     if successful_file_paths:
         zip_filename = f"Tikfetch_batch_{batch_id[:8]}.zip"
         zip_path = os.path.join(DOWNLOAD_DIR, zip_filename)
@@ -221,7 +263,6 @@ async def run_batch_download_task(batch_id: str, raw_urls: List[str]):
         except Exception as e:
             print("Failed to build ZIP archive:", e)
 
-    # Update overall batch status
     if batch_progress[batch_id]["failed_count"] == 0:
         batch_progress[batch_id]["status"] = "completed"
     elif batch_progress[batch_id]["completed_count"] > 0:

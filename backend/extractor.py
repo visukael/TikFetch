@@ -2,6 +2,7 @@ import re
 import urllib.parse
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
+import yt_dlp
 
 
 class TikDownloaderError(Exception):
@@ -83,6 +84,74 @@ def extract_tiktok_metadata(tiktok_url: str, html_content: str = "") -> dict:
     }
 
 
+def fetch_profile_videos(username_or_url: str, limit: int = 0) -> dict:
+    """
+    Extracts profile videos list using yt-dlp flat extraction.
+    If limit is 0, fetches all available videos on the user profile.
+    """
+    cleaned = username_or_url.strip()
+    match = re.search(r'@([a-zA-Z0-9_\.]+)', cleaned)
+    if match:
+        username = match.group(1)
+    else:
+        username = cleaned.lstrip("@").split("/")[0].split("?")[0]
+
+    if not username:
+        raise InvalidURLError("Please provide a valid TikTok username or profile URL.")
+
+    profile_url = f"https://www.tiktok.com/@{username}"
+    ydl_opts = {
+        'extract_flat': True,
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'socket_timeout': 20,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9'
+        }
+    }
+
+    if limit and limit > 0:
+        ydl_opts['playlistend'] = limit
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(profile_url, download=False)
+            entries = info.get('entries', []) or []
+            
+            videos = []
+            for item in entries:
+                if item:
+                    v_id = item.get('id')
+                    v_url = item.get('url') or item.get('webpage_url')
+                    if not v_url and v_id:
+                        v_url = f"https://www.tiktok.com/@{username}/video/{v_id}"
+                    
+                    v_title = item.get('title') or f"Video {v_id}"
+                    thumbnails = item.get('thumbnails', [])
+                    cover = thumbnails[0].get('url') if thumbnails else ""
+
+                    videos.append({
+                        "id": v_id,
+                        "title": v_title,
+                        "url": v_url,
+                        "cover": cover,
+                        "view_count": item.get('view_count', 0),
+                        "like_count": item.get('like_count', 0)
+                    })
+
+            return {
+                "username": username,
+                "profile_url": profile_url,
+                "total": len(videos),
+                "videos": videos
+            }
+    except Exception as exc:
+        raise TikDownloaderError(f"Failed to fetch profile for @{username}: {str(exc)}")
+
+
 async def extract_hd_download_url(tiktok_url: str) -> dict:
     """
     Requests tikdownloader.io/api/ajaxSearch using Chrome browser TLS impersonation
@@ -97,7 +166,6 @@ async def extract_hd_download_url(tiktok_url: str) -> dict:
 
     async with AsyncSession(impersonate="chrome", timeout=20.0) as session:
         try:
-            # Step 1: Visit homepage to collect session cookies and page tokens
             home_res = await session.get(home_url)
             if home_res.status_code != 200:
                 raise TikDownloaderError(f"TikDownloader homepage returned HTTP status {home_res.status_code}.")
@@ -109,7 +177,6 @@ async def extract_hd_download_url(tiktok_url: str) -> dict:
             k_token = token_m.group(1) if token_m else ""
             k_exp = exp_m.group(1) if exp_m else ""
 
-            # Step 2: Perform POST search
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 "X-Requested-With": "XMLHttpRequest",
@@ -169,7 +236,6 @@ def parse_hd_link_from_html(html_content: str) -> str:
     
     for anchor in anchors:
         text = anchor.get_text(strip=True)
-        # Strictly match 'Download MP4 HD' (case-insensitive)
         if re.search(r'\bDownload\s+MP4\s+HD\b', text, re.IGNORECASE):
             href = anchor.get("href")
             if href and href.startswith("http"):
